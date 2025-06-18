@@ -1,0 +1,206 @@
+# Makefile for BTC Federation Test Suite
+# Adapted from: https://github.com/vTCP-Foundation/vtcpd-test-suite/blob/main/Makefile.example
+# Modified for single btc-federation-node binary dependency
+
+# Configuration constants
+BTC_FEDERATION_SOURCE := /path/to/btc-federation/binary
+BTC_FEDERATION_BIN := deps/btc-federation-node
+DEFAULT_DISTRO := ubuntu
+DEFAULT_PORT := 9000
+TEST_TIMEOUT := 30s
+
+# Docker image names (following vtcpd-test-suite naming pattern)
+DOCKER_IMAGE_BASE := btc-federation-test
+DOCKER_TAG_UBUNTU := ubuntu
+DOCKER_TAG_MANJARO := manjaro
+
+# Test configuration
+TEST_NETWORK := btc-federation-test-net
+TEST_NODE_COUNT := 2
+
+.PHONY: help
+help: ## Show this help message
+	@echo "BTC Federation Test Suite Makefile"
+	@echo "Adapted from vtcpd-test-suite for single binary execution"
+	@echo ""
+	@echo "Available targets:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
+
+.PHONY: check-binary
+check-binary: ## Check if BTC federation binary exists
+	@if [ ! -f "$(BTC_FEDERATION_BIN)" ]; then \
+		echo "Error: BTC federation binary not found at $(BTC_FEDERATION_BIN)"; \
+		echo "Please ensure the binary is available before building."; \
+		echo "You can use 'make init-deps-symlinks' to copy the binary."; \
+		exit 1; \
+	fi
+	@echo "✓ BTC federation binary found at $(BTC_FEDERATION_BIN)"
+
+.PHONY: init-deps
+init-deps: ## Initialize dependencies directory
+	@mkdir -p deps
+	@echo "Dependencies directory created at deps/"
+	@echo "Please place btc-federation-node binary in deps/ directory"
+	@echo "Or use 'make init-deps-symlinks' to copy from a source location"
+
+.PHONY: init-deps-symlinks
+init-deps-symlinks: ## Copy btc-federation-node binary to deps directory
+	@mkdir -p deps
+	@if [ -n "$(BTC_FEDERATION_SOURCE)" ] && [ -f "$(BTC_FEDERATION_SOURCE)" ]; then \
+		cp "$(BTC_FEDERATION_SOURCE)" "$(BTC_FEDERATION_BIN)"; \
+		chmod +x "$(BTC_FEDERATION_BIN)"; \
+		echo "✓ BTC federation binary copied from $(BTC_FEDERATION_SOURCE)"; \
+	else \
+		echo "Error: Please specify BTC_FEDERATION_SOURCE environment variable"; \
+		echo "Usage: make init-deps-symlinks BTC_FEDERATION_SOURCE=/path/to/btc-federation-node"; \
+		echo "Or manually copy the binary to $(BTC_FEDERATION_BIN)"; \
+		exit 1; \
+	fi
+
+.PHONY: docker-build-test-ubuntu
+docker-build-test-ubuntu: check-binary ## Build Docker test image for Ubuntu
+	@echo "Building BTC federation test image for Ubuntu..."
+	docker build \
+		--build-arg DISTRO=ubuntu \
+		-t $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU) \
+		.
+	@echo "✓ Ubuntu test image built: $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU)"
+
+.PHONY: docker-build-test-manjaro
+docker-build-test-manjaro: check-binary ## Build Docker test image for Manjaro
+	@echo "Building BTC federation test image for Manjaro..."
+	docker build \
+		--build-arg DISTRO=manjaro \
+		-t $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_MANJARO) \
+		.
+	@echo "✓ Manjaro test image built: $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_MANJARO)"
+
+.PHONY: docker-build-test
+docker-build-test: docker-build-test-ubuntu ## Build Docker test image for default distribution
+	@echo "✓ Default test image built for Ubuntu: $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU)"
+
+.PHONY: docker-build-all
+docker-build-all: docker-build-test-ubuntu docker-build-test-manjaro ## Build Docker test images for all distributions
+	@echo "✓ All test images built successfully"
+	@echo "  - $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU)"
+	@echo "  - $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_MANJARO)"
+
+.PHONY: test-network-create
+test-network-create: ## Create Docker network for testing
+	@docker network inspect $(TEST_NETWORK) >/dev/null 2>&1 || \
+		docker network create $(TEST_NETWORK)
+	@echo "✓ Test network $(TEST_NETWORK) ready"
+
+.PHONY: test-network-remove
+test-network-remove: ## Remove Docker test network
+	@docker network rm $(TEST_NETWORK) 2>/dev/null || true
+	@echo "✓ Test network $(TEST_NETWORK) removed"
+
+.PHONY: test-cleanup
+test-cleanup: ## Clean up test containers and networks
+	@echo "Cleaning up test environment..."
+	@docker ps -a --filter "label=btc-federation-test" -q | xargs -r docker rm -f
+	@$(MAKE) test-network-remove
+	@echo "✓ Test environment cleaned up"
+
+.PHONY: test
+test: docker-build-test test-cleanup test-network-create ## Run the test suite
+	@echo "Running BTC federation test suite..."
+	@echo "Test configuration:"
+	@echo "  - Distribution: $(DEFAULT_DISTRO)"
+	@echo "  - Node count: $(TEST_NODE_COUNT)"
+	@echo "  - Network: $(TEST_NETWORK)"
+	@echo "  - Timeout: $(TEST_TIMEOUT)"
+	@echo "  - Image: $(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU)"
+	@echo ""
+	DOCKER_IMAGE=$(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU) \
+	go test -timeout $(TEST_TIMEOUT) -v ./test/common/...
+	@$(MAKE) test-cleanup
+	@echo "✓ Test suite completed successfully"
+
+.PHONY: test-ubuntu
+test-ubuntu: docker-build-test-ubuntu test-cleanup test-network-create ## Run tests on Ubuntu
+	@echo "Running tests on Ubuntu distribution..."
+	DOCKER_IMAGE=$(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU) \
+	go test -timeout $(TEST_TIMEOUT) -v ./test/common/...
+	@$(MAKE) test-cleanup
+
+.PHONY: test-manjaro
+test-manjaro: docker-build-test-manjaro test-cleanup test-network-create ## Run tests on Manjaro
+	@echo "Running tests on Manjaro distribution..."
+	DOCKER_IMAGE=$(DOCKER_IMAGE_BASE):$(DOCKER_TAG_MANJARO) \
+	go test -timeout $(TEST_TIMEOUT) -v ./test/common/...
+	@$(MAKE) test-cleanup
+
+.PHONY: test-all-distros
+test-all-distros: test-ubuntu test-manjaro ## Run tests on all supported distributions
+	@echo "✓ All distribution tests completed successfully"
+
+.PHONY: run-node
+run-node: docker-build-test test-network-create ## Run a single BTC federation node for testing
+	@echo "Starting single BTC federation node..."
+	@PRIVATE_KEY=$$(openssl rand -base64 64) && \
+	docker run -d \
+		--name btc-federation-test-node \
+		--network $(TEST_NETWORK) \
+		--label btc-federation-test \
+		-e PRIVATE_KEY="$$PRIVATE_KEY" \
+		-e IP_ADDRESS=0.0.0.0 \
+		-e PORT=$(DEFAULT_PORT) \
+		-p $(DEFAULT_PORT):$(DEFAULT_PORT) \
+		$(DOCKER_IMAGE_BASE):$(DOCKER_TAG_UBUNTU)
+	@echo "✓ Node started and available at localhost:$(DEFAULT_PORT)"
+	@echo "  Use 'make stop-node' to stop the node"
+
+.PHONY: stop-node
+stop-node: ## Stop the running test node
+	@docker stop btc-federation-test-node 2>/dev/null || true
+	@docker rm btc-federation-test-node 2>/dev/null || true
+	@echo "✓ Test node stopped and removed"
+
+.PHONY: logs
+logs: ## Show logs from test containers
+	@docker ps --filter "label=btc-federation-test" --format "table {{.Names}}\t{{.Status}}"
+	@echo ""
+	@for container in $$(docker ps --filter "label=btc-federation-test" -q); do \
+		echo "=== Logs for container $$container ==="; \
+		docker logs --tail=50 $$container; \
+		echo ""; \
+	done
+
+.PHONY: clean
+clean: test-cleanup ## Clean up all test artifacts
+	@echo "Cleaning up all test artifacts..."
+	@docker images $(DOCKER_IMAGE_BASE) -q | xargs -r docker rmi -f
+	@docker system prune -f --filter "label=btc-federation-test"
+	@echo "✓ All test artifacts cleaned up"
+
+.PHONY: setup
+setup: init-deps ## Initial setup for development
+	@echo "Setting up BTC federation test suite development environment..."
+	@echo "1. Dependencies directory created"
+	@echo "2. Please place btc-federation-node binary in deps/ directory"
+	@echo "   Or use: make init-deps-symlinks BTC_FEDERATION_SOURCE=/path/to/binary"
+	@echo "3. Run 'make docker-build-test' to build test images"
+	@echo "4. Run 'make test' to execute test suite"
+	@echo ""
+	@echo "✓ Development environment setup completed"
+
+# Development targets
+.PHONY: go-mod-tidy
+go-mod-tidy: ## Tidy Go modules
+	go mod tidy
+	@echo "✓ Go modules tidied"
+
+.PHONY: go-test
+go-test: ## Run Go tests without Docker
+	go test -v ./...
+
+.PHONY: go-fmt
+go-fmt: ## Format Go code
+	go fmt ./...
+	@echo "✓ Go code formatted"
+
+.PHONY: dev-setup
+dev-setup: go-mod-tidy go-fmt setup ## Complete development setup
+	@echo "✓ Development environment fully configured" 

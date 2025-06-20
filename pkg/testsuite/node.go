@@ -24,6 +24,16 @@ const (
 	DefaultLogLevel = "info"
 	// DefaultLogFormat is the default logging format
 	DefaultLogFormat = "json"
+	// DefaultConsoleOutput is the default console output setting
+	DefaultConsoleOutput = true
+	// DefaultConsoleColor is the default console color setting
+	DefaultConsoleColor = true
+	// DefaultFileOutput is the default file output setting
+	DefaultFileOutput = true
+	// DefaultFileName is the default log file name
+	DefaultFileName = "btc-federation.log"
+	// DefaultFileMaxSize is the default log file max size
+	DefaultFileMaxSize = "10MB"
 )
 
 // NodeConfig represents the configuration for a BTC federation node
@@ -42,8 +52,13 @@ type NodeConfig struct {
 	ConnectionTimeout    string `yaml:"connection_timeout"`
 
 	// Logging configuration
-	LogLevel  string `yaml:"log_level"`
-	LogFormat string `yaml:"log_format"`
+	LogLevel      string `yaml:"log_level"`
+	LogFormat     string `yaml:"log_format"`
+	ConsoleOutput bool   `yaml:"console_output"`
+	ConsoleColor  bool   `yaml:"console_color"`
+	FileOutput    bool   `yaml:"file_output"`
+	FileName      string `yaml:"file_name"`
+	FileMaxSize   string `yaml:"file_max_size"`
 
 	// Container configuration
 	ContainerName string `yaml:"container_name"`
@@ -136,6 +151,19 @@ func validateAndSetDefaults(config *NodeConfig) error {
 		config.LogFormat = DefaultLogFormat
 	}
 
+	// Set default values for new logging fields
+	config.ConsoleOutput = DefaultConsoleOutput
+	config.ConsoleColor = DefaultConsoleColor
+	config.FileOutput = DefaultFileOutput
+
+	if config.FileName == "" {
+		config.FileName = DefaultFileName
+	}
+
+	if config.FileMaxSize == "" {
+		config.FileMaxSize = DefaultFileMaxSize
+	}
+
 	// Set container defaults
 	if config.ContainerName == "" {
 		config.ContainerName = fmt.Sprintf("btc-federation-node-%d", config.Port)
@@ -172,6 +200,8 @@ func (n *Node) GetEnvironmentVariables() []string {
 		fmt.Sprintf("PRIVATE_KEY=%s", n.Config.PrivateKey),
 		fmt.Sprintf("IP_ADDRESS=%s", n.Config.IPAddress),
 		fmt.Sprintf("PORT=%s", strconv.Itoa(n.Config.Port)),
+		fmt.Sprintf("LOGGING_FILE_NAME=%s", n.Config.FileName),
+		fmt.Sprintf("LOGGING_FILE_MAX_SIZE=%s", n.Config.FileMaxSize),
 	}
 }
 

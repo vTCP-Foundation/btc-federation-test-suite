@@ -36,6 +36,11 @@ ENV PRIVATE_KEY=""
 ENV IP_ADDRESS="0.0.0.0"
 ENV PORT="9000"
 
+# Environment variables for logging configuration
+# Default values will be set if not provided
+ENV LOGGING_FILE_NAME=""
+ENV LOGGING_FILE_MAX_SIZE=""
+
 # Set working directory
 WORKDIR /btc-federation
 
@@ -69,20 +74,34 @@ RUN echo '#!/bin/bash' > /generate-config.sh && \
     echo '    exit 1' >> /generate-config.sh && \
     echo 'fi' >> /generate-config.sh && \
     echo '' >> /generate-config.sh && \
+    echo '# Set default values for logging configuration if not provided' >> /generate-config.sh && \
+    echo 'if [ -z "$LOGGING_FILE_NAME" ]; then' >> /generate-config.sh && \
+    echo '    LOGGING_FILE_NAME="btc-federation.log"' >> /generate-config.sh && \
+    echo 'fi' >> /generate-config.sh && \
+    echo '' >> /generate-config.sh && \
+    echo 'if [ -z "$LOGGING_FILE_MAX_SIZE" ]; then' >> /generate-config.sh && \
+    echo '    LOGGING_FILE_MAX_SIZE="10MB"' >> /generate-config.sh && \
+    echo 'fi' >> /generate-config.sh && \
+    echo '' >> /generate-config.sh && \
     echo '# Generate conf.yaml directly using environment variables' >> /generate-config.sh && \
     echo '# Following vtcpd-test-suite environment variable substitution pattern' >> /generate-config.sh && \
     echo 'cat > /btc-federation/conf.yaml << EOF' >> /generate-config.sh && \
     echo 'node:' >> /generate-config.sh && \
-    echo '    private_key: $PRIVATE_KEY' >> /generate-config.sh && \
+    echo '    private_key: '\$PRIVATE_KEY >> /generate-config.sh && \
     echo 'network:' >> /generate-config.sh && \
     echo '    addresses:' >> /generate-config.sh && \
-    echo '        - /ip4/$IP_ADDRESS/tcp/$PORT' >> /generate-config.sh && \
+    echo '        - /ip4/'\$IP_ADDRESS'/tcp/'\$PORT >> /generate-config.sh && \
     echo 'peers:' >> /generate-config.sh && \
     echo '    exchange_interval: 30s' >> /generate-config.sh && \
     echo '    connection_timeout: 10s' >> /generate-config.sh && \
     echo 'logging:' >> /generate-config.sh && \
     echo '    level: info' >> /generate-config.sh && \
     echo '    format: json' >> /generate-config.sh && \
+    echo '    console_output: true' >> /generate-config.sh && \
+    echo '    console_color: true' >> /generate-config.sh && \
+    echo '    file_output: true' >> /generate-config.sh && \
+    echo '    file_name: '\$LOGGING_FILE_NAME >> /generate-config.sh && \
+    echo '    file_max_size: '\$LOGGING_FILE_MAX_SIZE >> /generate-config.sh && \
     echo 'EOF' >> /generate-config.sh && \
     echo '' >> /generate-config.sh && \
     echo 'echo "Configuration generated successfully:"' >> /generate-config.sh && \
@@ -99,8 +118,10 @@ RUN echo '#!/bin/bash' > /start-node.sh && \
     echo 'echo "Starting BTC federation node..."' >> /start-node.sh && \
     echo 'echo "Using configuration:"' >> /start-node.sh && \
     echo 'echo "  PRIVATE_KEY: [REDACTED]"' >> /start-node.sh && \
-    echo 'echo "  IP_ADDRESS: $IP_ADDRESS"' >> /start-node.sh && \
-    echo 'echo "  PORT: $PORT"' >> /start-node.sh && \
+    echo 'echo "  IP_ADDRESS: '\$IP_ADDRESS'"' >> /start-node.sh && \
+    echo 'echo "  PORT: '\$PORT'"' >> /start-node.sh && \
+    echo 'echo "  LOGGING_FILE_NAME: '\$LOGGING_FILE_NAME'"' >> /start-node.sh && \
+    echo 'echo "  LOGGING_FILE_MAX_SIZE: '\$LOGGING_FILE_MAX_SIZE'"' >> /start-node.sh && \
     echo '' >> /start-node.sh && \
     echo '# Generate configuration using environment variables' >> /start-node.sh && \
     echo '/generate-config.sh' >> /start-node.sh && \

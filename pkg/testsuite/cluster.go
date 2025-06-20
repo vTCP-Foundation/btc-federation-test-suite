@@ -231,24 +231,24 @@ func (c *Cluster) RunNode(ctx context.Context, t *testing.T, wg *sync.WaitGroup,
 
 	// Add cleanup using t.Cleanup following vtcpd-test-suite pattern
 	t.Cleanup(func() {
-		t.Logf("Cleaning up container %s", containerName)
+		// t.Logf("Cleaning up container %s", containerName)
 
-		// Stop container gracefully
-		timeout := int(ContainerShutdownTimeout.Seconds())
-		if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
-			t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
-		}
+		// // Stop container gracefully
+		// timeout := int(ContainerShutdownTimeout.Seconds())
+		// if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
+		// 	t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
+		// }
 
-		// Remove container
-		if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
-			t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
-		}
+		// // Remove container
+		// if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
+		// 	t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
+		// }
 
-		// Update node state
-		node.IsRunning = false
-		delete(c.nodes, containerName)
+		// // Update node state
+		// node.IsRunning = false
+		// delete(c.nodes, containerName)
 
-		t.Logf("✓ Container %s cleaned up", containerName)
+		// t.Logf("✓ Container %s cleaned up", containerName)
 	})
 
 	t.Logf("✓ Node %s started successfully", containerName)
@@ -496,6 +496,42 @@ func (c *Cluster) execInContainer(node *Node, cmd []string) error {
 	}
 
 	return c.dockerClient.ContainerExecStart(c.ctx, response.ID, types.ExecStartCheck{})
+}
+
+// ExecInContainer executes a command in a container and returns output
+func (c *Cluster) ExecInContainer(containerID string, cmd []string) (string, error) {
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+
+	response, err := c.dockerClient.ContainerExecCreate(c.ctx, containerID, execConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	hijackedResponse, err := c.dockerClient.ContainerExecAttach(c.ctx, response.ID, types.ExecStartCheck{})
+	if err != nil {
+		return "", fmt.Errorf("failed to attach to exec: %w", err)
+	}
+	defer hijackedResponse.Close()
+
+	// Read the output
+	output := make([]byte, 4096)
+	n, err := hijackedResponse.Reader.Read(output)
+	if err != nil && err.Error() != "EOF" {
+		return "", fmt.Errorf("failed to read exec output: %w", err)
+	}
+
+	// Remove Docker stream headers (first 8 bytes) and trim whitespace
+	result := string(output[:n])
+	if len(result) > 8 {
+		result = result[8:]
+	}
+	result = strings.TrimSpace(result)
+
+	return result, nil
 }
 
 // Cleanup cleans up cluster resources (but not the network)

@@ -1,3 +1,6 @@
 [submodule "workspace"]
 	path = workspace
 	url = git@github.com:vTCP-Foundation/workspace.git
+[submodule "btc-federation"]
+	path = btc-federation
+	url = git@github.com:vTCP-Foundation/btc-federation.git

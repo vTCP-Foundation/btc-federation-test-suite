@@ -10,24 +10,53 @@ FROM manjarolinux/base:latest AS manjaro-base
 # Select the appropriate base image
 FROM ${DISTRO}-base AS base
 
-# Install common dependencies
+# Pass the DISTRO argument to this stage
+ARG DISTRO=ubuntu
+
+# Install common dependencies for both Ubuntu and Manjaro
+# Added net-tools (netstat) and iputils (ping) for P2P connection testing
 RUN if [ "$DISTRO" = "ubuntu" ]; then \
+        echo "Installing packages on Ubuntu..." && \
         apt-get update && \
         apt-get install -y \
             ca-certificates \
             curl \
             netcat-openbsd \
             procps \
-            gettext-base && \
-        rm -rf /var/lib/apt/lists/*; \
+            gettext-base \
+            iproute2 \
+            lsof \
+            tcpdump \
+            vim \
+            net-tools \
+            iputils-ping && \
+        rm -rf /var/lib/apt/lists/* && \
+        echo "Installed utilities:" && \
+        echo "  Vim: $(which vim)" && \
+        echo "  Netstat: $(which netstat)" && \
+        echo "  Ping: $(which ping)"; \
     elif [ "$DISTRO" = "manjaro" ]; then \
+        echo "Installing packages on Manjaro..." && \
         pacman -Sy --noconfirm \
             ca-certificates \
             curl \
             netcat \
             procps-ng \
-            gettext && \
-        pacman -Scc --noconfirm; \
+            gettext \
+            iproute2 \
+            lsof \
+            tcpdump \
+            vim \
+            net-tools \
+            iputils && \
+        pacman -Scc --noconfirm && \
+        echo "Installed utilities:" && \
+        echo "  Vim: $(which vim)" && \
+        echo "  Netstat: $(which netstat)" && \
+        echo "  Ping: $(which ping)"; \
+    else \
+        echo "Error: Unsupported DISTRO: $DISTRO" && \
+        exit 1; \
     fi
 
 # Environment variables for node configuration
@@ -40,6 +69,10 @@ ENV PORT="9000"
 # Default values will be set if not provided
 ENV LOGGING_FILE_NAME=""
 ENV LOGGING_FILE_MAX_SIZE=""
+
+# Environment variable for peers configuration
+# Added for task 03-4: peers.yaml support
+ENV PEERS_YAML_CONTENT=""
 
 # Set working directory
 WORKDIR /btc-federation
@@ -92,7 +125,6 @@ RUN echo '#!/bin/bash' > /generate-config.sh && \
     echo '    addresses:' >> /generate-config.sh && \
     echo '        - /ip4/'\$IP_ADDRESS'/tcp/'\$PORT >> /generate-config.sh && \
     echo 'peers:' >> /generate-config.sh && \
-    echo '    exchange_interval: 30s' >> /generate-config.sh && \
     echo '    connection_timeout: 10s' >> /generate-config.sh && \
     echo 'logging:' >> /generate-config.sh && \
     echo '    level: info' >> /generate-config.sh && \
@@ -103,6 +135,17 @@ RUN echo '#!/bin/bash' > /generate-config.sh && \
     echo '    file_name: '\$LOGGING_FILE_NAME >> /generate-config.sh && \
     echo '    file_max_size: '\$LOGGING_FILE_MAX_SIZE >> /generate-config.sh && \
     echo 'EOF' >> /generate-config.sh && \
+    echo '' >> /generate-config.sh && \
+    echo '# Generate peers.yaml if PEERS_YAML_CONTENT is provided' >> /generate-config.sh && \
+    echo '# Added for task 03-4: peers.yaml support' >> /generate-config.sh && \
+    echo 'if [ ! -z "$PEERS_YAML_CONTENT" ] && [ "$PEERS_YAML_CONTENT" != "" ]; then' >> /generate-config.sh && \
+    echo '    echo "Generating peers.yaml from environment variable..."' >> /generate-config.sh && \
+    echo '    echo "$PEERS_YAML_CONTENT" > /btc-federation/peers.yaml' >> /generate-config.sh && \
+    echo '    echo "peers.yaml generated successfully:"' >> /generate-config.sh && \
+    echo '    cat /btc-federation/peers.yaml' >> /generate-config.sh && \
+    echo 'else' >> /generate-config.sh && \
+    echo '    echo "No peers configuration provided, skipping peers.yaml generation"' >> /generate-config.sh && \
+    echo 'fi' >> /generate-config.sh && \
     echo '' >> /generate-config.sh && \
     echo 'echo "Configuration generated successfully:"' >> /generate-config.sh && \
     echo 'cat /btc-federation/conf.yaml' >> /generate-config.sh && \
@@ -122,6 +165,11 @@ RUN echo '#!/bin/bash' > /start-node.sh && \
     echo 'echo "  PORT: '\$PORT'"' >> /start-node.sh && \
     echo 'echo "  LOGGING_FILE_NAME: '\$LOGGING_FILE_NAME'"' >> /start-node.sh && \
     echo 'echo "  LOGGING_FILE_MAX_SIZE: '\$LOGGING_FILE_MAX_SIZE'"' >> /start-node.sh && \
+    echo 'if [ ! -z "$PEERS_YAML_CONTENT" ] && [ "$PEERS_YAML_CONTENT" != "" ]; then' >> /start-node.sh && \
+    echo '    echo "  PEERS_YAML_CONTENT: [PROVIDED]"' >> /start-node.sh && \
+    echo 'else' >> /start-node.sh && \
+    echo '    echo "  PEERS_YAML_CONTENT: [NOT PROVIDED]"' >> /start-node.sh && \
+    echo 'fi' >> /start-node.sh && \
     echo '' >> /start-node.sh && \
     echo '# Generate configuration using environment variables' >> /start-node.sh && \
     echo '/generate-config.sh' >> /start-node.sh && \
@@ -133,7 +181,7 @@ RUN echo '#!/bin/bash' > /start-node.sh && \
 
 # Health check using process check instead of port check for mock binary
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep -f "btc-federation" || exit 1
+    CMD pgrep -f "btc-federation-node" || exit 1
 
 # Expose the default port (will be overridden by environment variable)
 EXPOSE ${PORT}

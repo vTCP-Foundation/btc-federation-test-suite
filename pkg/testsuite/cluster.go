@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"gopkg.in/yaml.v2"
 )
 
 // Cluster configuration constants
@@ -33,6 +35,24 @@ const (
 	// HealthCheckInterval is the interval between health checks
 	HealthCheckInterval = 2 * time.Second
 )
+
+// TCPConnection represents a TCP connection in a container
+// Added for task 03-1: TCP connection analysis
+type TCPConnection struct {
+	// Source connection details
+	SourceIP   string
+	SourcePort int
+
+	// Destination connection details
+	DestIP   string
+	DestPort int
+
+	// Connection state (ESTABLISHED, LISTEN, etc.)
+	State string
+
+	// Additional metadata
+	Protocol string
+}
 
 // Cluster represents a BTC federation node cluster for testing
 // Adapted from vtcpd-test-suite Cluster structure
@@ -114,9 +134,21 @@ func (c *Cluster) createNetwork() error {
 	}
 
 	// Create new network only if it doesn't exist (vtcpd-test-suite pattern)
+	// Configure IPAM to support static IP addresses
+	ipamConfig := network.IPAM{
+		Driver: "default",
+		Config: []network.IPAMConfig{
+			{
+				Subnet:  "172.30.0.0/16",
+				Gateway: "172.30.0.1",
+			},
+		},
+	}
+
 	networkResponse, err := c.dockerClient.NetworkCreate(c.ctx, c.networkName, types.NetworkCreate{
 		CheckDuplicate: true,
 		Driver:         "bridge",
+		IPAM:           &ipamConfig,
 		Options: map[string]string{
 			"com.docker.network.bridge.enable_icc":           "true",
 			"com.docker.network.bridge.enable_ip_masquerade": "true",
@@ -231,24 +263,24 @@ func (c *Cluster) RunNode(ctx context.Context, t *testing.T, wg *sync.WaitGroup,
 
 	// Add cleanup using t.Cleanup following vtcpd-test-suite pattern
 	t.Cleanup(func() {
-		// t.Logf("Cleaning up container %s", containerName)
+		t.Logf("Cleaning up container %s", containerName)
 
-		// // Stop container gracefully
-		// timeout := int(ContainerShutdownTimeout.Seconds())
-		// if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
-		// 	t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
-		// }
+		// Stop container gracefully
+		timeout := int(ContainerShutdownTimeout.Seconds())
+		if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
+			t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
+		}
 
-		// // Remove container
-		// if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
-		// 	t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
-		// }
+		// Remove container
+		if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
+			t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
+		}
 
-		// // Update node state
-		// node.IsRunning = false
-		// delete(c.nodes, containerName)
+		// Update node state
+		node.IsRunning = false
+		delete(c.nodes, containerName)
 
-		// t.Logf("✓ Container %s cleaned up", containerName)
+		t.Logf("✓ Container %s cleaned up", containerName)
 	})
 
 	t.Logf("✓ Node %s started successfully", containerName)
@@ -300,7 +332,7 @@ func (c *Cluster) createContainer(node *Node) (string, error) {
 		Env:          node.GetEnvironmentVariables(),
 		Labels:       node.GetLabels(),
 		Healthcheck: &container.HealthConfig{
-			Test:        []string{"CMD", "pgrep", "-f", "btc-federation"},
+			Test:        []string{"CMD", "pgrep", "-f", "btc-federation-node"},
 			Interval:    HealthCheckInterval,
 			Timeout:     5 * time.Second,
 			StartPeriod: 10 * time.Second,
@@ -313,16 +345,25 @@ func (c *Cluster) createContainer(node *Node) (string, error) {
 		PortBindings: portBindings,
 		NetworkMode:  container.NetworkMode(c.networkName),
 		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
+			Name: "no",
 		},
 	}
 
-	// Network configuration
+	// Network configuration with static IP support
+	endpointSettings := &network.EndpointSettings{
+		NetworkID: c.networkID,
+	}
+
+	// Set static IP if provided
+	if node.Config.IPAddress != "" && node.Config.IPAddress != "0.0.0.0" {
+		endpointSettings.IPAMConfig = &network.EndpointIPAMConfig{
+			IPv4Address: node.Config.IPAddress,
+		}
+	}
+
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
-			c.networkName: {
-				NetworkID: c.networkID,
-			},
+			c.networkName: endpointSettings,
 		},
 	}
 
@@ -531,6 +572,16 @@ func (c *Cluster) ExecInContainer(containerID string, cmd []string) (string, err
 	}
 	result = strings.TrimSpace(result)
 
+	// Check exit code of the executed command
+	inspectResp, err := c.dockerClient.ContainerExecInspect(c.ctx, response.ID)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect exec: %w", err)
+	}
+
+	if inspectResp.ExitCode != 0 {
+		return result, fmt.Errorf("command failed with exit code %d", inspectResp.ExitCode)
+	}
+
 	return result, nil
 }
 
@@ -576,4 +627,758 @@ func (c *Cluster) GetRunningNodes() []*Node {
 		}
 	}
 	return runningNodes
+}
+
+// CheckTCPConnections analyzes TCP connections in a container
+// Added for task 03-1: TCP connection analysis capability
+func (c *Cluster) CheckTCPConnections(containerID string) ([]TCPConnection, error) {
+	// Use ss command to get TCP connection information
+	// ss is more modern and reliable than netstat
+	cmd := []string{"ss", "-tuln"}
+
+	output, err := c.ExecInContainer(containerID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute ss command in container %s: %w", containerID, err)
+	}
+
+	connections, err := c.parseTCPConnections(output)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse TCP connections: %w", err)
+	}
+
+	return connections, nil
+}
+
+// GetActiveConnectionsCount returns the count of active TCP connections on P2P ports
+// Added for task 03-1: Simplified connection counting for P2P testing
+func (c *Cluster) GetActiveConnectionsCount(containerID string) (int, error) {
+	connections, err := c.CheckTCPConnections(containerID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check TCP connections: %w", err)
+	}
+
+	// Count connections on P2P ports (9000-9001) that are ESTABLISHED
+	count := 0
+	for _, conn := range connections {
+		if (conn.SourcePort >= 9000 && conn.SourcePort <= 9001) ||
+			(conn.DestPort >= 9000 && conn.DestPort <= 9001) {
+			if conn.State == "ESTAB" || conn.State == "ESTABLISHED" {
+				count++
+			}
+		}
+	}
+
+	return count, nil
+}
+
+// parseTCPConnections parses ss command output to extract TCP connection information
+// Helper method for CheckTCPConnections
+func (c *Cluster) parseTCPConnections(output string) ([]TCPConnection, error) {
+	var connections []TCPConnection
+	lines := strings.Split(output, "\n")
+
+	// Regular expression to parse ss output
+	// Expected format: tcp   ESTAB      0      0      192.168.1.100:9000      192.168.1.101:45678
+	tcpRegex := regexp.MustCompile(`^(tcp|udp)\s+([A-Z-]+)\s+\d+\s+\d+\s+([^:\s]+):(\d+)\s+([^:\s]+):(\d+)`)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Netid") {
+			continue
+		}
+
+		matches := tcpRegex.FindStringSubmatch(line)
+		if len(matches) == 7 {
+			sourcePort, err1 := strconv.Atoi(matches[4])
+			destPort, err2 := strconv.Atoi(matches[6])
+
+			if err1 != nil || err2 != nil {
+				// Skip lines with invalid port numbers
+				continue
+			}
+
+			connection := TCPConnection{
+				Protocol:   matches[1],
+				State:      matches[2],
+				SourceIP:   matches[3],
+				SourcePort: sourcePort,
+				DestIP:     matches[5],
+				DestPort:   destPort,
+			}
+
+			connections = append(connections, connection)
+		}
+	}
+
+	return connections, nil
+}
+
+// CheckNodeLogContains searches for a pattern in a node's log file
+// Added for task 03-2: Node log analysis through cluster context
+func (c *Cluster) CheckNodeLogContains(containerID string, pattern string) (bool, error) {
+	// Find node by container ID
+	var targetNode *Node
+	for _, node := range c.nodes {
+		if node.ContainerID == containerID {
+			targetNode = node
+			break
+		}
+	}
+
+	if targetNode == nil {
+		return false, fmt.Errorf("node with container ID %s not found", containerID)
+	}
+
+	if !targetNode.IsRunning {
+		return false, fmt.Errorf("node is not running")
+	}
+
+	// Get the log file path from the node configuration
+	logPath := targetNode.getLogFilePath()
+
+	// Use grep to search for the pattern in the log file
+	cmd := []string{"grep", "-q", pattern, logPath}
+
+	_, err := c.ExecInContainer(containerID, cmd)
+	if err != nil {
+		// grep exit codes:
+		// 0 = pattern found
+		// 1 = pattern not found
+		// 2 = file not found or other error
+		if strings.Contains(err.Error(), "exit code 1") {
+			return false, nil // Pattern not found, but no error
+		}
+		// For exit code 2 (file not found) or other errors, return error
+		return false, fmt.Errorf("failed to search log file: %w", err)
+	}
+
+	return true, nil
+}
+
+// GetNodePeersConfig retrieves peers configuration from a node's peers.yaml file
+// Added for task 03-2: Node peers configuration access through cluster context
+func (c *Cluster) GetNodePeersConfig(containerID string) (map[string]interface{}, error) {
+	// Find node by container ID
+	var targetNode *Node
+	for _, node := range c.nodes {
+		if node.ContainerID == containerID {
+			targetNode = node
+			break
+		}
+	}
+
+	if targetNode == nil {
+		return nil, fmt.Errorf("node with container ID %s not found", containerID)
+	}
+
+	if !targetNode.IsRunning {
+		return nil, fmt.Errorf("node is not running")
+	}
+
+	// Get the peers config file path
+	peersPath := targetNode.getPeersConfigPath()
+
+	// Read the peers.yaml file content
+	cmd := []string{"cat", peersPath}
+
+	yamlContent, err := c.ExecInContainer(containerID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read peers config file: %w", err)
+	}
+
+	if strings.TrimSpace(yamlContent) == "" {
+		return make(map[string]interface{}), nil // Return empty map for empty file
+	}
+
+	// Parse YAML content
+	var peersConfig map[string]interface{}
+	if err := yaml.Unmarshal([]byte(yamlContent), &peersConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse peers YAML: %w", err)
+	}
+
+	return peersConfig, nil
+}
+
+// GetContainerIP returns the IP address of a container in the cluster network
+func (c *Cluster) GetContainerIP(containerID string) (string, error) {
+	// Inspect the container to get network information
+	containerInfo, err := c.dockerClient.ContainerInspect(c.ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect container %s: %w", containerID, err)
+	}
+
+	// Get the network settings
+	networkSettings := containerInfo.NetworkSettings
+	if networkSettings == nil {
+		return "", fmt.Errorf("no network settings found for container %s", containerID)
+	}
+
+	// Look for the cluster network
+	networkName := c.networkName
+	if networkName == "" {
+		return "", fmt.Errorf("no network name configured for cluster")
+	}
+
+	// Find the network in the container's networks
+	if networkSettings.Networks == nil {
+		return "", fmt.Errorf("no networks found for container %s", containerID)
+	}
+
+	network, exists := networkSettings.Networks[networkName]
+	if !exists {
+		return "", fmt.Errorf("container %s is not connected to network %s", containerID, networkName)
+	}
+
+	if network.IPAddress == "" {
+		return "", fmt.Errorf("no IP address found for container %s in network %s", containerID, networkName)
+	}
+
+	return network.IPAddress, nil
+}
+
+// UpdateNodePeersConfig updates the peers.yaml file in a running container
+func (c *Cluster) UpdateNodePeersConfig(node *Node) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
+
+	if !node.IsRunning {
+		return fmt.Errorf("node %s is not running", node.Config.ContainerName)
+	}
+
+	// Trigger peers config update in the node
+	if err := node.UpdatePeersConfig(); err != nil {
+		return fmt.Errorf("failed to generate peers config: %w", err)
+	}
+
+	// Get the updated peers config data
+	yamlData := node.GetUpdatedPeersConfig()
+	if len(yamlData) == 0 {
+		return fmt.Errorf("no peers config data to update")
+	}
+
+	// Write the YAML content to the container's peers.yaml file
+	peersPath := node.getPeersConfigPath()
+
+	// Create the command to write the file
+	cmd := []string{"sh", "-c", fmt.Sprintf("cat > %s", peersPath)}
+
+	// Execute the command and pipe the YAML content to it
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+
+	response, err := c.dockerClient.ContainerExecCreate(c.ctx, node.ContainerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create exec for peers config update: %w", err)
+	}
+
+	hijackedResponse, err := c.dockerClient.ContainerExecAttach(c.ctx, response.ID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("failed to attach to exec for peers config update: %w", err)
+	}
+	defer hijackedResponse.Close()
+
+	// Write the YAML data to stdin
+	if _, err := hijackedResponse.Conn.Write(yamlData); err != nil {
+		return fmt.Errorf("failed to write peers config data: %w", err)
+	}
+
+	// Close the connection to signal EOF
+	if err := hijackedResponse.CloseWrite(); err != nil {
+		return fmt.Errorf("failed to close write connection: %w", err)
+	}
+
+	// Wait for the command to complete and check exit code
+	inspectResponse, err := c.dockerClient.ContainerExecInspect(c.ctx, response.ID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exec for peers config update: %w", err)
+	}
+
+	// Wait for command completion
+	for inspectResponse.Running {
+		time.Sleep(100 * time.Millisecond)
+		inspectResponse, err = c.dockerClient.ContainerExecInspect(c.ctx, response.ID)
+		if err != nil {
+			return fmt.Errorf("failed to inspect exec status: %w", err)
+		}
+	}
+
+	if inspectResponse.ExitCode != 0 {
+		return fmt.Errorf("failed to update peers config file, exit code: %d", inspectResponse.ExitCode)
+	}
+
+	// Mark the node as updated
+	node.MarkPeersUpdated()
+
+	return nil
+}
+
+// RestartNode stops and starts a container to reload configuration
+func (c *Cluster) RestartNode(ctx context.Context, node *Node) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
+
+	if !node.IsRunning {
+		return fmt.Errorf("node %s is not running", node.Config.ContainerName)
+	}
+
+	// Stop container
+	timeout := int(ContainerShutdownTimeout.Seconds())
+	if err := c.dockerClient.ContainerStop(ctx, node.ContainerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		return fmt.Errorf("failed to stop container %s: %w", node.Config.ContainerName, err)
+	}
+
+	// Start container again
+	if err := c.dockerClient.ContainerStart(ctx, node.ContainerID, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container %s: %w", node.Config.ContainerName, err)
+	}
+
+	// Wait for container to be healthy
+	if err := c.waitForNodeHealthy(ctx, node); err != nil {
+		return fmt.Errorf("node %s failed to become healthy after restart: %w", node.Config.ContainerName, err)
+	}
+
+	return nil
+}
+
+// WaitForNodeHealthy waits for a node to become healthy - public wrapper
+func (c *Cluster) WaitForNodeHealthy(ctx context.Context, node *Node) error {
+	return c.waitForNodeHealthy(ctx, node)
+}
+
+// CheckLibP2PConnections перевіряє libp2p з'єднання через netstat
+func (c *Cluster) CheckLibP2PConnections(containerID string) ([]LibP2PConnection, error) {
+	// Execute netstat to find P2P connections
+	cmd := []string{"netstat", "-tupln"}
+	output, err := c.ExecInContainer(containerID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute netstat: %w", err)
+	}
+
+	return c.parseLibP2PConnections(output)
+}
+
+// CheckPeerReachability перевіряє доступність peer'ів через ping/nc
+func (c *Cluster) CheckPeerReachability(containerID string, targetIP string, targetPort int) (bool, error) {
+	// Try to connect using netcat
+	cmd := []string{"nc", "-z", "-w", "3", targetIP, strconv.Itoa(targetPort)}
+	_, err := c.ExecInContainer(containerID, cmd)
+
+	return err == nil, nil
+}
+
+// CheckProcessConnections перевіряє з'єднання конкретного процесу через lsof
+func (c *Cluster) CheckProcessConnections(containerID string, processName string) ([]ProcessConnection, error) {
+	// Find process PID first
+	pidCmd := []string{"pgrep", "-f", processName}
+	pidOutput, err := c.ExecInContainer(containerID, pidCmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find process %s: %w", processName, err)
+	}
+
+	pid := strings.TrimSpace(pidOutput)
+	if pid == "" {
+		return nil, fmt.Errorf("process %s not found", processName)
+	}
+
+	// Use lsof to check connections for this PID
+	lsofCmd := []string{"lsof", "-p", pid, "-i", "-n"}
+	lsofOutput, err := c.ExecInContainer(containerID, lsofCmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute lsof: %w", err)
+	}
+
+	return c.parseProcessConnections(lsofOutput)
+}
+
+// CheckNetworkNamespaceConnections перевіряє з'єднання через ss
+func (c *Cluster) CheckNetworkNamespaceConnections(containerID string) ([]NetworkConnection, error) {
+	// Use ss command for more detailed network information
+	cmd := []string{"ss", "-tuln", "-p"}
+	output, err := c.ExecInContainer(containerID, cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute ss: %w", err)
+	}
+
+	return c.parseNetworkConnections(output)
+}
+
+// AnalyzeLibP2PBehavior аналізує поведінку libp2p через логи та мережеві з'єднання
+func (c *Cluster) AnalyzeLibP2PBehavior(containerID string) (*LibP2PAnalysis, error) {
+	analysis := &LibP2PAnalysis{
+		ContainerID: containerID,
+		Timestamp:   time.Now(),
+	}
+
+	// 1. Check TCP connections
+	tcpConns, err := c.CheckTCPConnections(containerID)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("TCP check failed: %v", err))
+	} else {
+		analysis.TCPConnections = tcpConns
+	}
+
+	// 2. Check libp2p specific connections
+	libp2pConns, err := c.CheckLibP2PConnections(containerID)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("LibP2P check failed: %v", err))
+	} else {
+		analysis.LibP2PConnections = libp2pConns
+	}
+
+	// 3. Check process connections
+	processConns, err := c.CheckProcessConnections(containerID, "btc-federation-node")
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("Process check failed: %v", err))
+	} else {
+		analysis.ProcessConnections = processConns
+	}
+
+	// 4. Check network namespace
+	nsConns, err := c.CheckNetworkNamespaceConnections(containerID)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("Network namespace check failed: %v", err))
+	} else {
+		analysis.NetworkConnections = nsConns
+	}
+
+	// 5. Analyze logs for P2P patterns
+	logPatterns := []string{
+		"Connection established",
+		"peer connected",
+		"Bootstrap successful",
+		"connected_peers",
+		"libp2p",
+		"multiaddr",
+	}
+
+	analysis.LogMatches = make(map[string]bool)
+	for _, pattern := range logPatterns {
+		if found, err := c.CheckNodeLogContains(containerID, pattern); err == nil && found {
+			analysis.LogMatches[pattern] = true
+		}
+	}
+
+	return analysis, nil
+}
+
+// parseLibP2PConnections парсить вивід netstat для libp2p з'єднань
+func (c *Cluster) parseLibP2PConnections(output string) ([]LibP2PConnection, error) {
+	var connections []LibP2PConnection
+	lines := strings.Split(output, "\n")
+
+	for _, line := range lines {
+		if strings.Contains(line, "ESTABLISHED") {
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				continue
+			}
+
+			localAddr := fields[3]
+			remoteAddr := fields[4]
+
+			// Parse local address
+			localParts := strings.Split(localAddr, ":")
+			if len(localParts) < 2 {
+				continue
+			}
+			localPort, _ := strconv.Atoi(localParts[len(localParts)-1])
+
+			// Parse remote address
+			remoteParts := strings.Split(remoteAddr, ":")
+			if len(remoteParts) < 2 {
+				continue
+			}
+			remotePort, _ := strconv.Atoi(remoteParts[len(remoteParts)-1])
+
+			// Check if this looks like a P2P connection (ports 9000-9010 range)
+			if (localPort >= 9000 && localPort <= 9010) || (remotePort >= 9000 && remotePort <= 9010) {
+				conn := LibP2PConnection{
+					Protocol:   "tcp",
+					LocalAddr:  localAddr,
+					RemoteAddr: remoteAddr,
+					State:      "ESTABLISHED",
+				}
+				connections = append(connections, conn)
+			}
+		}
+	}
+
+	return connections, nil
+}
+
+// parseProcessConnections парсить вивід lsof
+func (c *Cluster) parseProcessConnections(output string) ([]ProcessConnection, error) {
+	var connections []ProcessConnection
+	lines := strings.Split(output, "\n")
+
+	for i, line := range lines {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue // Skip header and empty lines
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 9 {
+			continue
+		}
+
+		// lsof output format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+		conn := ProcessConnection{
+			Command: fields[0],
+			PID:     fields[1],
+			FD:      fields[3],
+			Type:    fields[4],
+			Node:    fields[7],
+			Name:    fields[8],
+		}
+
+		// Parse connection details from NAME field
+		if strings.Contains(conn.Name, "->") {
+			parts := strings.Split(conn.Name, "->")
+			if len(parts) == 2 {
+				conn.LocalAddr = strings.TrimSpace(parts[0])
+				conn.RemoteAddr = strings.TrimSpace(parts[1])
+				conn.State = "ESTABLISHED"
+			}
+		} else if strings.Contains(conn.Name, ":") {
+			conn.LocalAddr = conn.Name
+			conn.State = "LISTEN"
+		}
+
+		connections = append(connections, conn)
+	}
+
+	return connections, nil
+}
+
+// parseNetworkConnections парсить вивід ss
+func (c *Cluster) parseNetworkConnections(output string) ([]NetworkConnection, error) {
+	var connections []NetworkConnection
+	lines := strings.Split(output, "\n")
+
+	for i, line := range lines {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue // Skip header and empty lines
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+
+		// ss output format: State Recv-Q Send-Q Local_Address:Port Peer_Address:Port Process
+		conn := NetworkConnection{
+			State:     fields[0],
+			RecvQ:     fields[1],
+			SendQ:     fields[2],
+			LocalAddr: fields[3],
+			PeerAddr:  fields[4],
+		}
+
+		if len(fields) > 5 {
+			conn.Process = strings.Join(fields[5:], " ")
+		}
+
+		connections = append(connections, conn)
+	}
+
+	return connections, nil
+}
+
+// LibP2PConnection represents a libp2p network connection
+type LibP2PConnection struct {
+	Protocol   string `json:"protocol"`
+	LocalAddr  string `json:"local_addr"`
+	RemoteAddr string `json:"remote_addr"`
+	State      string `json:"state"`
+}
+
+// ProcessConnection represents a process-specific connection from lsof
+type ProcessConnection struct {
+	Command    string `json:"command"`
+	PID        string `json:"pid"`
+	FD         string `json:"fd"`
+	Type       string `json:"type"`
+	Node       string `json:"node"`
+	Name       string `json:"name"`
+	LocalAddr  string `json:"local_addr"`
+	RemoteAddr string `json:"remote_addr"`
+	State      string `json:"state"`
+}
+
+// NetworkConnection represents a network connection from ss
+type NetworkConnection struct {
+	State     string `json:"state"`
+	RecvQ     string `json:"recv_q"`
+	SendQ     string `json:"send_q"`
+	LocalAddr string `json:"local_addr"`
+	PeerAddr  string `json:"peer_addr"`
+	Process   string `json:"process"`
+}
+
+// LibP2PAnalysis contains comprehensive libp2p analysis
+type LibP2PAnalysis struct {
+	ContainerID        string              `json:"container_id"`
+	Timestamp          time.Time           `json:"timestamp"`
+	TCPConnections     []TCPConnection     `json:"tcp_connections"`
+	LibP2PConnections  []LibP2PConnection  `json:"libp2p_connections"`
+	ProcessConnections []ProcessConnection `json:"process_connections"`
+	NetworkConnections []NetworkConnection `json:"network_connections"`
+	LogMatches         map[string]bool     `json:"log_matches"`
+	Errors             []string            `json:"errors"`
+}
+
+// CheckDockerNetworkConnectivity перевіряє мережеву зв'язність між контейнерами
+func (c *Cluster) CheckDockerNetworkConnectivity(containerAID, containerBID string) (*DockerNetworkAnalysis, error) {
+	analysis := &DockerNetworkAnalysis{
+		Timestamp: time.Now(),
+	}
+
+	// Get container A info
+	containerAInfo, err := c.dockerClient.ContainerInspect(c.ctx, containerAID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect container A: %w", err)
+	}
+	analysis.ContainerAInfo = extractNetworkInfo(containerAInfo)
+
+	// Get container B info
+	containerBInfo, err := c.dockerClient.ContainerInspect(c.ctx, containerBID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect container B: %w", err)
+	}
+	analysis.ContainerBInfo = extractNetworkInfo(containerBInfo)
+
+	// Check if containers are on the same network
+	analysis.SameNetwork = checkSameNetwork(containerAInfo, containerBInfo)
+
+	// Test connectivity with ping
+	pingAB, err := c.testPingConnectivity(containerAID, analysis.ContainerBInfo.IPAddress)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("Ping A->B failed: %v", err))
+	} else {
+		analysis.PingAB = pingAB
+	}
+
+	pingBA, err := c.testPingConnectivity(containerBID, analysis.ContainerAInfo.IPAddress)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("Ping B->A failed: %v", err))
+	} else {
+		analysis.PingBA = pingBA
+	}
+
+	return analysis, nil
+}
+
+// testPingConnectivity tests ping connectivity between containers
+func (c *Cluster) testPingConnectivity(containerID, targetIP string) (bool, error) {
+	cmd := []string{"ping", "-c", "3", "-W", "2", targetIP}
+	_, err := c.ExecInContainer(containerID, cmd)
+	return err == nil, err
+}
+
+// extractNetworkInfo extracts network information from container inspect
+func extractNetworkInfo(containerInfo types.ContainerJSON) ContainerNetworkInfo {
+	info := ContainerNetworkInfo{
+		ContainerID:   containerInfo.ID,
+		ContainerName: containerInfo.Name,
+	}
+
+	if containerInfo.NetworkSettings != nil {
+		for networkName, network := range containerInfo.NetworkSettings.Networks {
+			info.NetworkName = networkName
+			info.IPAddress = network.IPAddress
+			info.Gateway = network.Gateway
+			info.MacAddress = network.MacAddress
+			break // Take first network
+		}
+	}
+
+	return info
+}
+
+// checkSameNetwork checks if two containers are on the same Docker network
+func checkSameNetwork(containerA, containerB types.ContainerJSON) bool {
+	if containerA.NetworkSettings == nil || containerB.NetworkSettings == nil {
+		return false
+	}
+
+	for networkNameA := range containerA.NetworkSettings.Networks {
+		for networkNameB := range containerB.NetworkSettings.Networks {
+			if networkNameA == networkNameB {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CheckLibP2PProtocolHandshake перевіряє libp2p протокол handshake
+func (c *Cluster) CheckLibP2PProtocolHandshake(containerID string) (*ProtocolAnalysis, error) {
+	analysis := &ProtocolAnalysis{
+		ContainerID: containerID,
+		Timestamp:   time.Now(),
+	}
+
+	// Check for libp2p specific network traffic patterns
+	tcpdumpCmd := []string{"timeout", "5", "tcpdump", "-c", "10", "-n", "port", "9000", "or", "port", "9001"}
+	output, err := c.ExecInContainer(containerID, tcpdumpCmd)
+	if err != nil {
+		analysis.Errors = append(analysis.Errors, fmt.Sprintf("tcpdump failed: %v", err))
+	} else {
+		analysis.NetworkTraffic = output
+		analysis.HasTraffic = len(strings.TrimSpace(output)) > 0
+	}
+
+	// Check for multiaddr patterns in logs
+	multiAddrPatterns := []string{
+		"/ip4/",
+		"/tcp/",
+		"/p2p/",
+		"multiaddr",
+	}
+
+	analysis.MultiAddrMatches = make(map[string]bool)
+	for _, pattern := range multiAddrPatterns {
+		if found, err := c.CheckNodeLogContains(containerID, pattern); err == nil && found {
+			analysis.MultiAddrMatches[pattern] = true
+		}
+	}
+
+	return analysis, nil
+}
+
+// ContainerNetworkInfo contains network information for a container
+type ContainerNetworkInfo struct {
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name"`
+	NetworkName   string `json:"network_name"`
+	IPAddress     string `json:"ip_address"`
+	Gateway       string `json:"gateway"`
+	MacAddress    string `json:"mac_address"`
+}
+
+// DockerNetworkAnalysis contains Docker network connectivity analysis
+type DockerNetworkAnalysis struct {
+	Timestamp      time.Time            `json:"timestamp"`
+	ContainerAInfo ContainerNetworkInfo `json:"container_a_info"`
+	ContainerBInfo ContainerNetworkInfo `json:"container_b_info"`
+	SameNetwork    bool                 `json:"same_network"`
+	PingAB         bool                 `json:"ping_a_to_b"`
+	PingBA         bool                 `json:"ping_b_to_a"`
+	Errors         []string             `json:"errors"`
+}
+
+// ProtocolAnalysis contains libp2p protocol analysis
+type ProtocolAnalysis struct {
+	ContainerID      string          `json:"container_id"`
+	Timestamp        time.Time       `json:"timestamp"`
+	NetworkTraffic   string          `json:"network_traffic"`
+	HasTraffic       bool            `json:"has_traffic"`
+	MultiAddrMatches map[string]bool `json:"multiaddr_matches"`
+	Errors           []string        `json:"errors"`
 }

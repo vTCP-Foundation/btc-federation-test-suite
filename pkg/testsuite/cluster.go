@@ -3,6 +3,7 @@ package testsuite
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -54,6 +55,24 @@ type TCPConnection struct {
 	Protocol string
 }
 
+// NetworkConditions represents network conditions to apply to a node
+// Added for task 03-6: Network resilience testing
+type NetworkConditions struct {
+	// Network isolation - completely block network traffic
+	Isolated bool `json:"isolated"`
+
+	// Traffic control conditions
+	Latency    string `json:"latency,omitempty"`     // e.g., "100ms"
+	PacketLoss string `json:"packet_loss,omitempty"` // e.g., "10%"
+	Bandwidth  string `json:"bandwidth,omitempty"`   // e.g., "1mbit"
+
+	// Advanced conditions
+	Jitter      string `json:"jitter,omitempty"`      // e.g., "10ms"
+	Duplication string `json:"duplication,omitempty"` // e.g., "1%"
+	Corruption  string `json:"corruption,omitempty"`  // e.g., "0.1%"
+	Reordering  string `json:"reordering,omitempty"`  // e.g., "25% 50%"
+}
+
 // Cluster represents a BTC federation node cluster for testing
 // Adapted from vtcpd-test-suite Cluster structure
 type Cluster struct {
@@ -72,6 +91,8 @@ type ClusterConfig struct {
 	DockerImage string
 	NodeCount   int
 	BasePort    int
+	Subnet      string // Optional custom subnet, defaults to "172.30.0.0/16"
+	Gateway     string // Optional custom gateway, defaults to "172.30.0.1"
 }
 
 // NewCluster creates a new BTC federation cluster management instance
@@ -110,7 +131,7 @@ func NewCluster(config *ClusterConfig) (*Cluster, error) {
 	}
 
 	// Create Docker network
-	if err := cluster.createNetwork(); err != nil {
+	if err := cluster.createNetwork(config); err != nil {
 		return nil, fmt.Errorf("failed to create Docker network: %w", err)
 	}
 
@@ -119,28 +140,50 @@ func NewCluster(config *ClusterConfig) (*Cluster, error) {
 
 // createNetwork creates a Docker network for the cluster
 // Following vtcpd-test-suite network management patterns
-func (c *Cluster) createNetwork() error {
+func (c *Cluster) createNetwork(config *ClusterConfig) error {
+	log.Printf("Checking for existing Docker network: %s", c.networkName)
+
 	// Check if network already exists (following vtcpd-test-suite approach)
 	networks, err := c.dockerClient.NetworkList(c.ctx, types.NetworkListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list networks: %w", err)
 	}
 
+	// Search for existing network by name
 	for _, net := range networks {
 		if net.Name == c.networkName {
+			log.Printf("✓ Found existing Docker network: %s (ID: %s)", c.networkName, net.ID[:12])
+
+			// Verify network is in good state
+			networkInspect, err := c.dockerClient.NetworkInspect(c.ctx, net.ID, types.NetworkInspectOptions{})
+			if err != nil {
+				log.Printf("Warning: Failed to inspect existing network %s: %v", c.networkName, err)
+				// Continue to use the network even if inspection fails
+			} else {
+				log.Printf("✓ Network %s is active with driver: %s", c.networkName, networkInspect.Driver)
+			}
+
 			c.networkID = net.ID
 			return nil // Network already exists, reuse it
 		}
 	}
 
-	// Create new network only if it doesn't exist (vtcpd-test-suite pattern)
-	// Configure IPAM to support static IP addresses
+	log.Printf("Network %s not found, creating new network...", c.networkName)
+
+	// Find available subnet to avoid conflicts
+	subnet, gateway, err := c.findAvailableSubnet(networks, config)
+	if err != nil {
+		return fmt.Errorf("failed to find available subnet: %w", err)
+	}
+
+	log.Printf("Using subnet: %s, gateway: %s", subnet, gateway)
+
 	ipamConfig := network.IPAM{
 		Driver: "default",
 		Config: []network.IPAMConfig{
 			{
-				Subnet:  "172.30.0.0/16",
-				Gateway: "172.30.0.1",
+				Subnet:  subnet,
+				Gateway: gateway,
 			},
 		},
 	}
@@ -163,7 +206,70 @@ func (c *Cluster) createNetwork() error {
 	}
 
 	c.networkID = networkResponse.ID
+	log.Printf("✓ Successfully created new Docker network: %s (ID: %s)", c.networkName, networkResponse.ID[:12])
+
 	return nil
+}
+
+// findAvailableSubnet finds an available subnet that doesn't conflict with existing networks
+func (c *Cluster) findAvailableSubnet(existingNetworks []types.NetworkResource, config *ClusterConfig) (string, string, error) {
+	// Use custom subnet if provided
+	if config != nil && config.Subnet != "" && config.Gateway != "" {
+		// Verify custom subnet doesn't conflict
+		if !c.isSubnetInUse(existingNetworks, config.Subnet) {
+			return config.Subnet, config.Gateway, nil
+		}
+		log.Printf("Warning: Custom subnet %s conflicts with existing network, finding alternative", config.Subnet)
+	}
+
+	// Try different subnets in 172.x.0.0/16 range
+	baseSubnets := []string{
+		"172.30.0.0/16", // Default
+		"172.33.0.0/16",
+		"172.34.0.0/16",
+		"172.35.0.0/16",
+		"172.36.0.0/16",
+		"172.37.0.0/16",
+		"172.38.0.0/16",
+		"172.39.0.0/16",
+		"172.40.0.0/16",
+		"172.41.0.0/16",
+	}
+
+	for _, subnet := range baseSubnets {
+		if !c.isSubnetInUse(existingNetworks, subnet) {
+			gateway := strings.Replace(subnet, "0.0/16", "0.1", 1)
+			return subnet, gateway, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("no available subnet found in 172.x.0.0/16 range")
+}
+
+// isSubnetInUse checks if a subnet is already in use by existing networks
+func (c *Cluster) isSubnetInUse(networks []types.NetworkResource, targetSubnet string) bool {
+	for _, net := range networks {
+		// Skip the default bridge networks
+		if net.Name == "bridge" || net.Name == "host" || net.Name == "none" {
+			continue
+		}
+
+		// Get network details to check IPAM config
+		networkDetails, err := c.dockerClient.NetworkInspect(c.ctx, net.ID, types.NetworkInspectOptions{})
+		if err != nil {
+			log.Printf("Warning: Failed to inspect network %s: %v", net.Name, err)
+			continue
+		}
+
+		// Check all IPAM configs for subnet conflicts
+		for _, ipamConfig := range networkDetails.IPAM.Config {
+			if ipamConfig.Subnet == targetSubnet {
+				log.Printf("Subnet %s already used by network %s", targetSubnet, net.Name)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RunNode starts a single BTC federation node
@@ -442,51 +548,183 @@ func (c *Cluster) StopNode(containerName string) error {
 	return nil
 }
 
-// ConfigureNetworkConditions applies network conditions to the cluster
-// Adapted from vtcpd-test-suite network condition management
-func (c *Cluster) ConfigureNetworkConditions(conditions map[string]interface{}) error {
-	// Implementation for network conditions (latency, packet loss, etc.)
-	// This is a simplified implementation - can be extended for specific network conditions
+// ConfigureNetworkConditions applies network conditions to a specific node
+// Modified for task 03-6: Accept specific node and NetworkConditions struct
+func (c *Cluster) ConfigureNetworkConditions(node *Node, conditions *NetworkConditions) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
+
+	if !node.IsRunning {
+		return fmt.Errorf("node %s is not running", node.Config.ContainerName)
+	}
 
 	if conditions == nil {
 		return nil
 	}
 
-	// Apply conditions to each running node
-	for _, node := range c.nodes {
-		if !node.IsRunning {
-			continue
+	// Apply network isolation if specified
+	if conditions.Isolated {
+		if err := c.applyNetworkIsolation(node); err != nil {
+			return fmt.Errorf("failed to apply network isolation to node %s: %w", node.Config.ContainerName, err)
 		}
+	}
 
-		// Example: Apply latency if specified
-		if latency, exists := conditions["latency"]; exists {
-			if err := c.applyLatency(node, latency); err != nil {
-				return fmt.Errorf("failed to apply latency to node %s: %w", node.Config.ContainerName, err)
-			}
+	// Apply traffic control conditions if specified
+	if conditions.Latency != "" {
+		if err := c.applyLatency(node, conditions.Latency); err != nil {
+			return fmt.Errorf("failed to apply latency to node %s: %w", node.Config.ContainerName, err)
 		}
+	}
 
-		// Example: Apply packet loss if specified
-		if packetLoss, exists := conditions["packet_loss"]; exists {
-			if err := c.applyPacketLoss(node, packetLoss); err != nil {
-				return fmt.Errorf("failed to apply packet loss to node %s: %w", node.Config.ContainerName, err)
-			}
+	if conditions.PacketLoss != "" {
+		if err := c.applyPacketLoss(node, conditions.PacketLoss); err != nil {
+			return fmt.Errorf("failed to apply packet loss to node %s: %w", node.Config.ContainerName, err)
+		}
+	}
+
+	if conditions.Bandwidth != "" {
+		if err := c.applyBandwidthLimit(node, conditions.Bandwidth); err != nil {
+			return fmt.Errorf("failed to apply bandwidth limit to node %s: %w", node.Config.ContainerName, err)
+		}
+	}
+
+	// Apply advanced conditions if specified
+	if conditions.Jitter != "" {
+		if err := c.applyJitter(node, conditions.Jitter); err != nil {
+			return fmt.Errorf("failed to apply jitter to node %s: %w", node.Config.ContainerName, err)
+		}
+	}
+
+	if conditions.Duplication != "" {
+		if err := c.applyDuplication(node, conditions.Duplication); err != nil {
+			return fmt.Errorf("failed to apply duplication to node %s: %w", node.Config.ContainerName, err)
+		}
+	}
+
+	if conditions.Corruption != "" {
+		if err := c.applyCorruption(node, conditions.Corruption); err != nil {
+			return fmt.Errorf("failed to apply corruption to node %s: %w", node.Config.ContainerName, err)
+		}
+	}
+
+	if conditions.Reordering != "" {
+		if err := c.applyReordering(node, conditions.Reordering); err != nil {
+			return fmt.Errorf("failed to apply reordering to node %s: %w", node.Config.ContainerName, err)
 		}
 	}
 
 	return nil
 }
 
-// RemoveNetworkConditions removes network conditions from the cluster
-// Adapted from vtcpd-test-suite network condition cleanup
-func (c *Cluster) RemoveNetworkConditions() error {
-	// Remove network conditions from all running nodes
-	for _, node := range c.nodes {
-		if !node.IsRunning {
-			continue
-		}
+// RemoveNetworkConditions removes network conditions from a specific node
+// Modified for task 03-6: Accept specific node parameter
+func (c *Cluster) RemoveNetworkConditions(node *Node) error {
+	if node == nil {
+		return fmt.Errorf("node cannot be nil")
+	}
 
-		if err := c.clearNetworkConditions(node); err != nil {
-			return fmt.Errorf("failed to clear network conditions for node %s: %w", node.Config.ContainerName, err)
+	if !node.IsRunning {
+		return fmt.Errorf("node %s is not running", node.Config.ContainerName)
+	}
+
+	if err := c.clearNetworkConditions(node); err != nil {
+		return fmt.Errorf("failed to clear network conditions for node %s: %w", node.Config.ContainerName, err)
+	}
+
+	return nil
+}
+
+// applyNetworkIsolation completely isolates network for a node using multiple methods
+func (c *Cluster) applyNetworkIsolation(node *Node) error {
+	log.Printf("Applying comprehensive network isolation to container %s", node.ContainerID)
+
+	// Method 1: Disconnect from Docker networks (most effective)
+	if err := c.disconnectFromDockerNetworks(node); err != nil {
+		log.Printf("Warning: Docker network disconnect failed: %v", err)
+	}
+
+	// Method 2: Bring down network interface completely
+	interfaceCommands := [][]string{
+		{"ip", "link", "set", "eth0", "down"},
+		{"ifconfig", "eth0", "down"}, // Backup command
+	}
+
+	for _, cmd := range interfaceCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Network interface brought down successfully")
+			break // Success with one method is enough
+		}
+	}
+
+	// Method 3: Comprehensive iptables blocking (backup isolation)
+	iptablesCommands := [][]string{
+		// Flush existing rules first
+		{"iptables", "-F"},
+		{"iptables", "-X"},
+		{"iptables", "-t", "nat", "-F"},
+		{"iptables", "-t", "mangle", "-F"},
+		// Block all traffic in all directions
+		{"iptables", "-P", "INPUT", "DROP"},
+		{"iptables", "-P", "OUTPUT", "DROP"},
+		{"iptables", "-P", "FORWARD", "DROP"},
+		// Additional specific blocks
+		{"iptables", "-A", "INPUT", "-j", "DROP"},
+		{"iptables", "-A", "OUTPUT", "-j", "DROP"},
+		{"iptables", "-A", "FORWARD", "-j", "DROP"},
+	}
+
+	for _, cmd := range iptablesCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Applied iptables rule: %v", cmd)
+		}
+	}
+
+	// Method 4: Traffic control complete packet drop (triple backup)
+	tcCommands := [][]string{
+		// Clear existing tc rules
+		{"tc", "qdisc", "del", "dev", "eth0", "root"},
+		// Apply 100% packet loss
+		{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "loss", "100%"},
+	}
+
+	for _, cmd := range tcCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Applied tc rule: %v", cmd)
+		}
+	}
+
+	// Method 5: Block specific P2P ports (additional layer)
+	portBlockCommands := [][]string{
+		{"iptables", "-A", "INPUT", "-p", "tcp", "--dport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-A", "OUTPUT", "-p", "tcp", "--sport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-A", "INPUT", "-p", "udp", "--dport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-A", "OUTPUT", "-p", "udp", "--sport", "9000:9010", "-j", "DROP"},
+	}
+
+	for _, cmd := range portBlockCommands {
+		c.execInContainer(node, cmd) // Ignore errors - these are additional layers
+	}
+
+	log.Printf("✓ Comprehensive network isolation applied to container %s", node.ContainerID)
+	return nil
+}
+
+// disconnectFromDockerNetworks disconnects container from all Docker networks
+func (c *Cluster) disconnectFromDockerNetworks(node *Node) error {
+	// Get container info to see which networks it's connected to
+	containerInfo, err := c.dockerClient.ContainerInspect(context.Background(), node.ContainerID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	// Disconnect from all networks
+	for networkName := range containerInfo.NetworkSettings.Networks {
+		err = c.dockerClient.NetworkDisconnect(context.Background(), networkName, node.ContainerID, true)
+		if err != nil {
+			log.Printf("Warning: failed to disconnect from network %s: %v", networkName, err)
+		} else {
+			log.Printf("✓ Disconnected container from network: %s", networkName)
 		}
 	}
 
@@ -494,33 +732,158 @@ func (c *Cluster) RemoveNetworkConditions() error {
 }
 
 // applyLatency applies network latency to a node
-func (c *Cluster) applyLatency(node *Node, latency interface{}) error {
-	// Simplified implementation using tc (traffic control)
-	latencyStr, ok := latency.(string)
-	if !ok {
-		return fmt.Errorf("invalid latency value type")
-	}
+func (c *Cluster) applyLatency(node *Node, latency string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
 
-	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", latencyStr}
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", latency}
 	return c.execInContainer(node, cmd)
 }
 
 // applyPacketLoss applies packet loss to a node
-func (c *Cluster) applyPacketLoss(node *Node, packetLoss interface{}) error {
-	// Simplified implementation using tc (traffic control)
-	lossStr, ok := packetLoss.(string)
-	if !ok {
-		return fmt.Errorf("invalid packet loss value type")
-	}
+func (c *Cluster) applyPacketLoss(node *Node, packetLoss string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
 
-	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "loss", lossStr}
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "loss", packetLoss}
+	return c.execInContainer(node, cmd)
+}
+
+// applyBandwidthLimit applies bandwidth limitation to a node
+func (c *Cluster) applyBandwidthLimit(node *Node, bandwidth string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
+
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "tbf", "rate", bandwidth, "burst", "32kbit", "latency", "400ms"}
+	return c.execInContainer(node, cmd)
+}
+
+// applyJitter applies network jitter to a node
+func (c *Cluster) applyJitter(node *Node, jitter string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
+
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "50ms", jitter}
+	return c.execInContainer(node, cmd)
+}
+
+// applyDuplication applies packet duplication to a node
+func (c *Cluster) applyDuplication(node *Node, duplication string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
+
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "duplicate", duplication}
+	return c.execInContainer(node, cmd)
+}
+
+// applyCorruption applies packet corruption to a node
+func (c *Cluster) applyCorruption(node *Node, corruption string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
+
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "corrupt", corruption}
+	return c.execInContainer(node, cmd)
+}
+
+// applyReordering applies packet reordering to a node
+func (c *Cluster) applyReordering(node *Node, reordering string) error {
+	// Clear existing conditions first
+	c.clearNetworkConditions(node)
+
+	// Parse reordering parameter (e.g., "25% 50%")
+	cmd := []string{"tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "10ms", "reorder"}
+	cmd = append(cmd, strings.Fields(reordering)...)
 	return c.execInContainer(node, cmd)
 }
 
 // clearNetworkConditions clears all network conditions from a node
 func (c *Cluster) clearNetworkConditions(node *Node) error {
-	cmd := []string{"tc", "qdisc", "del", "dev", "eth0", "root"}
-	return c.execInContainer(node, cmd)
+	log.Printf("Removing comprehensive network isolation from container %s", node.ContainerID)
+
+	// Method 1: Reconnect to Docker networks (most important)
+	if err := c.reconnectToDockerNetworks(node); err != nil {
+		log.Printf("Warning: Docker network reconnect failed: %v", err)
+	}
+
+	// Method 2: Bring network interface back up
+	interfaceCommands := [][]string{
+		{"ip", "link", "set", "eth0", "up"},
+		{"ifconfig", "eth0", "up"}, // Backup command
+	}
+
+	for _, cmd := range interfaceCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Network interface brought up successfully")
+			break
+		}
+	}
+
+	// Method 3: Clear traffic control conditions
+	tcClearCommands := [][]string{
+		{"tc", "qdisc", "del", "dev", "eth0", "root"},
+		{"tc", "qdisc", "show", "dev", "eth0"}, // Verify clearing
+	}
+
+	for _, cmd := range tcClearCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Cleared tc rule: %v", cmd)
+		}
+	}
+
+	// Method 4: Reset iptables to permissive state
+	iptablesClearCommands := [][]string{
+		// Set default policies to ACCEPT
+		{"iptables", "-P", "INPUT", "ACCEPT"},
+		{"iptables", "-P", "OUTPUT", "ACCEPT"},
+		{"iptables", "-P", "FORWARD", "ACCEPT"},
+		// Flush all rules
+		{"iptables", "-F"},
+		{"iptables", "-X"},
+		{"iptables", "-t", "nat", "-F"},
+		{"iptables", "-t", "mangle", "-F"},
+		// Remove specific DROP rules (just in case)
+		{"iptables", "-D", "OUTPUT", "-j", "DROP"},
+		{"iptables", "-D", "INPUT", "-j", "DROP"},
+		{"iptables", "-D", "FORWARD", "-j", "DROP"},
+	}
+
+	for _, cmd := range iptablesClearCommands {
+		if err := c.execInContainer(node, cmd); err == nil {
+			log.Printf("✓ Applied iptables recovery rule: %v", cmd)
+		}
+	}
+
+	// Method 5: Clear specific port blocks
+	portClearCommands := [][]string{
+		{"iptables", "-D", "INPUT", "-p", "tcp", "--dport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-D", "OUTPUT", "-p", "tcp", "--sport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-D", "INPUT", "-p", "udp", "--dport", "9000:9010", "-j", "DROP"},
+		{"iptables", "-D", "OUTPUT", "-p", "udp", "--sport", "9000:9010", "-j", "DROP"},
+	}
+
+	for _, cmd := range portClearCommands {
+		c.execInContainer(node, cmd) // Ignore errors - these might not exist
+	}
+
+	log.Printf("✓ Comprehensive network isolation removed from container %s", node.ContainerID)
+	return nil
+}
+
+// reconnectToDockerNetworks reconnects container to the cluster network
+func (c *Cluster) reconnectToDockerNetworks(node *Node) error {
+	// Reconnect to the cluster network
+	err := c.dockerClient.NetworkConnect(context.Background(), c.networkID, node.ContainerID, &network.EndpointSettings{
+		IPAMConfig: &network.EndpointIPAMConfig{
+			IPv4Address: node.Config.IPAddress,
+		},
+	})
+	if err != nil {
+		log.Printf("Warning: failed to reconnect to cluster network: %v", err)
+		return err
+	}
+
+	log.Printf("✓ Reconnected container to cluster network with IP: %s", node.Config.IPAddress)
+	return nil
 }
 
 // execInContainer executes a command in a container

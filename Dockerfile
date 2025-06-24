@@ -91,12 +91,7 @@ RUN echo '#!/bin/bash' > /generate-config.sh && \
     echo '' >> /generate-config.sh && \
     echo 'set -e' >> /generate-config.sh && \
     echo '' >> /generate-config.sh && \
-    echo '# Validate required environment variables' >> /generate-config.sh && \
-    echo 'if [ -z "$PRIVATE_KEY" ]; then' >> /generate-config.sh && \
-    echo '    echo "Error: PRIVATE_KEY environment variable is required"' >> /generate-config.sh && \
-    echo '    exit 1' >> /generate-config.sh && \
-    echo 'fi' >> /generate-config.sh && \
-    echo '' >> /generate-config.sh && \
+    echo '# Validate required environment variables (removed PRIVATE_KEY validation)' >> /generate-config.sh && \
     echo 'if [ -z "$IP_ADDRESS" ]; then' >> /generate-config.sh && \
     echo '    echo "Error: IP_ADDRESS environment variable is required"' >> /generate-config.sh && \
     echo '    exit 1' >> /generate-config.sh && \
@@ -120,7 +115,7 @@ RUN echo '#!/bin/bash' > /generate-config.sh && \
     echo '# Following vtcpd-test-suite environment variable substitution pattern' >> /generate-config.sh && \
     echo 'cat > /btc-federation/conf.yaml << EOF' >> /generate-config.sh && \
     echo 'node:' >> /generate-config.sh && \
-    echo '    private_key: '\$PRIVATE_KEY >> /generate-config.sh && \
+    echo '    private_key: "'\$PRIVATE_KEY'"' >> /generate-config.sh && \
     echo 'network:' >> /generate-config.sh && \
     echo '    addresses:' >> /generate-config.sh && \
     echo '        - /ip4/'\$IP_ADDRESS'/tcp/'\$PORT >> /generate-config.sh && \

@@ -369,24 +369,24 @@ func (c *Cluster) RunNode(ctx context.Context, t *testing.T, wg *sync.WaitGroup,
 
 	// Add cleanup using t.Cleanup following vtcpd-test-suite pattern
 	t.Cleanup(func() {
-		t.Logf("Cleaning up container %s", containerName)
+		// t.Logf("Cleaning up container %s", containerName)
 
-		// Stop container gracefully
-		timeout := int(ContainerShutdownTimeout.Seconds())
-		if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
-			t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
-		}
+		// // Stop container gracefully
+		// timeout := int(ContainerShutdownTimeout.Seconds())
+		// if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
+		// 	t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
+		// }
 
-		// Remove container
-		if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
-			t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
-		}
+		// // Remove container
+		// if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
+		// 	t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
+		// }
 
-		// Update node state
-		node.IsRunning = false
-		delete(c.nodes, containerName)
+		// // Update node state
+		// node.IsRunning = false
+		// delete(c.nodes, containerName)
 
-		t.Logf("✓ Container %s cleaned up", containerName)
+		// t.Logf("✓ Container %s cleaned up", containerName)
 	})
 
 	t.Logf("✓ Node %s started successfully", containerName)
@@ -951,27 +951,27 @@ func (c *Cluster) ExecInContainer(containerID string, cmd []string) (string, err
 // Cleanup cleans up cluster resources (but not the network)
 // Following vtcpd-test-suite cleanup patterns - network is persistent
 func (c *Cluster) Cleanup() error {
-	var errors []string
+	// var errors []string
 
-	// Stop all nodes
-	for name := range c.nodes {
-		if err := c.StopNode(name); err != nil {
-			errors = append(errors, fmt.Sprintf("failed to stop node %s: %v", name, err))
-		}
-	}
+	// // Stop all nodes
+	// for name := range c.nodes {
+	// 	if err := c.StopNode(name); err != nil {
+	// 		errors = append(errors, fmt.Sprintf("failed to stop node %s: %v", name, err))
+	// 	}
+	// }
 
 	// NOTE: Do not remove network - following vtcpd-test-suite pattern
 	// Networks are shared between tests and should persist
 	// This prevents conflicts when multiple tests run concurrently
 
 	// Close Docker client
-	if err := c.dockerClient.Close(); err != nil {
-		errors = append(errors, fmt.Sprintf("failed to close Docker client: %v", err))
-	}
+	// if err := c.dockerClient.Close(); err != nil {
+	// 	errors = append(errors, fmt.Sprintf("failed to close Docker client: %v", err))
+	// }
 
-	if len(errors) > 0 {
-		return fmt.Errorf("cleanup errors: %s", strings.Join(errors, "; "))
-	}
+	// if len(errors) > 0 {
+	// 	return fmt.Errorf("cleanup errors: %s", strings.Join(errors, "; "))
+	// }
 
 	return nil
 }
@@ -1744,4 +1744,293 @@ type ProtocolAnalysis struct {
 	HasTraffic       bool            `json:"has_traffic"`
 	MultiAddrMatches map[string]bool `json:"multiaddr_matches"`
 	Errors           []string        `json:"errors"`
+}
+
+// RunConfigValidation runs a node specifically for configuration validation
+// This method starts a container, waits for it to complete, and returns the result
+func (c *Cluster) RunConfigValidation(ctx context.Context, node *Node) (*ConfigValidationResult, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node cannot be nil")
+	}
+
+	// Set cluster defaults
+	if node.Config.NetworkName == "" {
+		node.Config.NetworkName = c.networkName
+	}
+	if node.Config.DockerImage == "" {
+		node.Config.DockerImage = c.dockerImage
+	}
+
+	// Create unique container name if not set
+	containerName := node.Config.ContainerName
+	if containerName == "" {
+		containerName = fmt.Sprintf("config-validation-%d", time.Now().UnixNano())
+		node.Config.ContainerName = containerName
+	}
+
+	// Create container for validation (modified from createContainer)
+	containerID, err := c.createValidationContainer(node)
+	if err != nil {
+		return &ConfigValidationResult{
+			ExitCode: 1,
+			TimedOut: false,
+			Logs:     fmt.Sprintf("Failed to create container: %v", err),
+			Error:    err,
+		}, nil
+	}
+
+	// Start container
+	if err := c.dockerClient.ContainerStart(ctx, containerID, types.ContainerStartOptions{}); err != nil {
+		// Cleanup on failure
+		c.dockerClient.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
+		return &ConfigValidationResult{
+			ExitCode: 1,
+			TimedOut: false,
+			Logs:     fmt.Sprintf("Failed to start container: %v", err),
+			Error:    err,
+		}, nil
+	}
+
+	// Wait for container completion with timeout
+	exitCode, timedOut, err := c.waitForValidationCompletion(ctx, containerID)
+	if err != nil {
+		// Cleanup on error
+		c.dockerClient.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
+		return &ConfigValidationResult{
+			ExitCode: 1,
+			TimedOut: timedOut,
+			Logs:     fmt.Sprintf("Failed to wait for container completion: %v", err),
+			Error:    err,
+		}, nil
+	}
+
+	// Get container logs
+	logs, err := c.getValidationLogs(ctx, containerID)
+	if err != nil {
+		logs = fmt.Sprintf("Failed to retrieve logs: %v", err)
+	}
+
+	// Cleanup container
+	if removeErr := c.dockerClient.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
+		log.Printf("Warning: Failed to remove validation container %s: %v", containerID, removeErr)
+	}
+
+	return &ConfigValidationResult{
+		ExitCode: exitCode,
+		TimedOut: timedOut,
+		Logs:     logs,
+		Error:    nil,
+	}, nil
+}
+
+// createValidationContainer creates a Docker container for configuration validation
+func (c *Cluster) createValidationContainer(node *Node) (string, error) {
+	// Prepare port bindings (similar to createContainer but for validation)
+	portBindings := nat.PortMap{}
+	exposedPorts := nat.PortSet{}
+
+	portStr := strconv.Itoa(node.Config.Port)
+	containerPort := nat.Port(portStr + "/tcp")
+
+	portBindings[containerPort] = []nat.PortBinding{
+		{
+			HostIP:   "0.0.0.0",
+			HostPort: portStr,
+		},
+	}
+	exposedPorts[containerPort] = struct{}{}
+
+	// Container configuration with validation-specific settings
+	containerConfig := &container.Config{
+		Image:        node.Config.DockerImage,
+		ExposedPorts: exposedPorts,
+		Env:          node.GetEnvironmentVariables(),
+		Labels:       node.GetLabels(),
+		// No healthcheck for validation - we want the container to exit quickly
+	}
+
+	// Host configuration
+	hostConfig := &container.HostConfig{
+		PortBindings: portBindings,
+		NetworkMode:  container.NetworkMode(c.networkName),
+		RestartPolicy: container.RestartPolicy{
+			Name: "no",
+		},
+		// Set resource limits for validation containers
+		Resources: container.Resources{
+			Memory:   128 * 1024 * 1024, // 128MB
+			NanoCPUs: 250000000,         // 0.25 CPU
+		},
+	}
+
+	// Network configuration
+	endpointSettings := &network.EndpointSettings{
+		NetworkID: c.networkID,
+	}
+
+	// Set static IP if provided
+	if node.Config.IPAddress != "" && node.Config.IPAddress != "0.0.0.0" {
+		endpointSettings.IPAMConfig = &network.EndpointIPAMConfig{
+			IPv4Address: node.Config.IPAddress,
+		}
+	}
+
+	networkConfig := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			c.networkName: endpointSettings,
+		},
+	}
+
+	// Create container
+	response, err := c.dockerClient.ContainerCreate(
+		c.ctx,
+		containerConfig,
+		hostConfig,
+		networkConfig,
+		nil,
+		node.Config.ContainerName,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create validation container: %w", err)
+	}
+
+	return response.ID, nil
+}
+
+// waitForValidationCompletion waits for a validation container to complete
+func (c *Cluster) waitForValidationCompletion(ctx context.Context, containerID string) (int, bool, error) {
+	// Create timeout context for validation - shortened timeout since we expect quick startup
+	timeout := 10 * time.Second
+	validationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Since the application doesn't exit automatically, we need to check if it started successfully
+	// Wait a bit for the application to start - increased wait time for better log capture
+	time.Sleep(5 * time.Second)
+
+	// Check container logs to see if application started successfully
+	logs, err := c.getValidationLogs(ctx, containerID)
+	if err != nil {
+		log.Printf("Warning: Failed to get container logs: %v", err)
+	}
+
+	// Check if logs contain successful startup indicators
+	successIndicators := []string{
+		"Node started successfully",
+		"BTC Federation Node starting with config",
+		"Network manager started successfully",
+	}
+
+	hasSuccess := false
+	for _, indicator := range successIndicators {
+		if strings.Contains(logs, indicator) {
+			hasSuccess = true
+			break
+		}
+	}
+
+	// Check for error indicators
+	errorIndicators := []string{
+		"Error:",
+		"failed to",
+		"configuration validation failed:",
+		"FATAL",
+	}
+
+	hasError := false
+	for _, indicator := range errorIndicators {
+		if strings.Contains(logs, indicator) {
+			hasError = true
+			break
+		}
+	}
+
+	// Stop the container forcefully
+	if err := c.dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
+		// If stop fails, force kill
+		c.dockerClient.ContainerKill(ctx, containerID, "SIGKILL")
+	}
+
+	// Wait for container to stop
+	statusCh, errCh := c.dockerClient.ContainerWait(validationCtx, containerID, container.WaitConditionNotRunning)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return 1, false, fmt.Errorf("error waiting for container: %w", err)
+		}
+	case status := <-statusCh:
+		// If container exited on its own, use its exit code
+		if status.StatusCode != 0 {
+			return int(status.StatusCode), false, nil
+		}
+	case <-validationCtx.Done():
+		// Timeout occurred
+		return 1, true, fmt.Errorf("validation timeout after %v", timeout)
+	}
+
+	// Determine success based on log analysis
+	if hasError {
+		return 1, false, nil
+	} else if hasSuccess {
+		return 0, false, nil
+	} else {
+		// No clear indicators, assume failure
+		return 1, false, nil
+	}
+}
+
+// getValidationLogs retrieves logs from a validation container
+func (c *Cluster) getValidationLogs(ctx context.Context, containerID string) (string, error) {
+	// Get container logs
+	logReader, err := c.dockerClient.ContainerLogs(ctx, containerID, types.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Details:    false,
+		Timestamps: false,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get container logs: %w", err)
+	}
+	defer logReader.Close()
+
+	// Read all available logs
+	var allData []byte
+	buffer := make([]byte, 4096)
+	for {
+		n, err := logReader.Read(buffer)
+		if n > 0 {
+			allData = append(allData, buffer[:n]...)
+		}
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return "", fmt.Errorf("failed to read container logs: %w", err)
+		}
+	}
+
+	// Convert to string and clean up Docker headers
+	logs := string(allData)
+
+	// Remove Docker stream headers (8-byte headers appear throughout)
+	// Simple approach: remove binary characters and clean up
+	cleanLogs := ""
+	lines := strings.Split(logs, "\n")
+	for _, line := range lines {
+		// Skip empty lines and lines that start with binary data
+		if len(line) > 0 && line[0] >= 32 && line[0] <= 126 {
+			cleanLogs += line + "\n"
+		}
+	}
+
+	return strings.TrimSpace(cleanLogs), nil
+}
+
+// ConfigValidationResult represents the result of configuration validation
+type ConfigValidationResult struct {
+	ExitCode int
+	TimedOut bool
+	Logs     string
+	Error    error
 }

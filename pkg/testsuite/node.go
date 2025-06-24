@@ -330,18 +330,6 @@ func (n *Node) String() string {
 		n.Config.IPAddress, n.Config.Port, n.Config.ContainerName, status)
 }
 
-// CheckLogContains searches for a specific pattern in the node's log file
-// Added for task 03-2: Log analysis capability for P2P connection verification
-func (n *Node) CheckLogContains(pattern string) (bool, error) {
-	if !n.IsRunning {
-		return false, fmt.Errorf("node is not running")
-	}
-
-	// This method requires cluster context for container access
-	// In practice, this method would be called through the cluster
-	return false, fmt.Errorf("method must be called through cluster reference - use cluster.CheckNodeLogContains instead")
-}
-
 // GetPeersConfig retrieves the peers configuration from the peers.yaml file
 // Added for task 03-2: Peers configuration access for testing validation
 func (n *Node) GetPeersConfig() (map[string]interface{}, error) {

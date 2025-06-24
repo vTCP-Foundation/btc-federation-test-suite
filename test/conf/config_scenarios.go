@@ -279,3 +279,58 @@ func (s *ConfigScenarios) CreateNodeConfigForCompletelyInvalid() *testsuite.Node
 		FileMaxSize:       "invalid-size",    // Invalid size
 	}
 }
+
+// ========================================
+// Peers.yaml Validation Scenarios
+// Task 05-3: peers.yaml Validation Tests
+// ========================================
+
+// CreateNodeConfigForMissingPeersFile creates NodeConfig for scenario 1: Missing peers.yaml
+// This should result in standalone mode (success scenario with exit code 0)
+func (s *ConfigScenarios) CreateNodeConfigForMissingPeersFile() *testsuite.NodeConfig {
+	// For missing peers.yaml, provide valid base configuration
+	// The system should start successfully without peers.yaml and log standalone mode
+	return &testsuite.NodeConfig{
+		PrivateKey:    TestPrivateKey, // Use valid private key
+		IPAddress:     "0.0.0.0",
+		Port:          9100, // Use high port range to avoid conflicts
+		LogLevel:      TestLogLevel,
+		LogFormat:     TestLogFormat,
+		ConsoleOutput: true,
+		// Don't set Peers - should trigger standalone mode (success)
+	}
+}
+
+// CreateNodeConfigForEmptyPeersFile creates NodeConfig for scenario 2: Empty peers.yaml file
+// This should result in a validation error (exit code 1)
+func (s *ConfigScenarios) CreateNodeConfigForEmptyPeersFile() *testsuite.NodeConfig {
+	// For empty peers.yaml file scenario, we create a configuration that should cause
+	// the system to expect peers.yaml but find it empty
+	return &testsuite.NodeConfig{
+		PrivateKey:    TestPrivateKey, // Valid private key
+		IPAddress:     "0.0.0.0",
+		Port:          9101, // Use high port range to avoid conflicts
+		LogLevel:      TestLogLevel,
+		LogFormat:     TestLogFormat,
+		ConsoleOutput: true,
+		// Simulate empty peers.yaml by providing invalid/empty peer configuration
+		Peers: []testsuite.PeerConfig{}, // Empty but present - should cause parsing error
+	}
+}
+
+// CreateNodeConfigForEmptyPeersValue creates NodeConfig for scenario 3: Empty peers value
+// This should result in standalone mode (success scenario with exit code 0)
+func (s *ConfigScenarios) CreateNodeConfigForEmptyPeersValue() *testsuite.NodeConfig {
+	// For empty peers value scenario (peers: [] or peers:), provide valid base config
+	// This should start successfully and log standalone mode message
+	return &testsuite.NodeConfig{
+		PrivateKey:    TestPrivateKey, // Use valid private key
+		IPAddress:     "0.0.0.0",
+		Port:          9102, // Use high port range to avoid conflicts
+		LogLevel:      TestLogLevel,
+		LogFormat:     TestLogFormat,
+		ConsoleOutput: true,
+		// Empty peers slice should trigger standalone mode (success)
+		Peers: []testsuite.PeerConfig{}, // Explicitly set empty peers
+	}
+}

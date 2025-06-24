@@ -369,24 +369,24 @@ func (c *Cluster) RunNode(ctx context.Context, t *testing.T, wg *sync.WaitGroup,
 
 	// Add cleanup using t.Cleanup following vtcpd-test-suite pattern
 	t.Cleanup(func() {
-		// t.Logf("Cleaning up container %s", containerName)
+		t.Logf("Cleaning up container %s", containerName)
 
-		// // Stop container gracefully
-		// timeout := int(ContainerShutdownTimeout.Seconds())
-		// if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
-		// 	t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
-		// }
+		// Stop container gracefully
+		timeout := int(ContainerShutdownTimeout.Seconds())
+		if stopErr := c.dockerClient.ContainerStop(context.Background(), containerID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
+			t.Logf("Warning: Failed to stop container %s: %v", containerName, stopErr)
+		}
 
-		// // Remove container
-		// if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
-		// 	t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
-		// }
+		// Remove container
+		if removeErr := c.dockerClient.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{Force: true}); removeErr != nil {
+			t.Logf("Warning: Failed to remove container %s: %v", containerName, removeErr)
+		}
 
-		// // Update node state
-		// node.IsRunning = false
-		// delete(c.nodes, containerName)
+		// Update node state
+		node.IsRunning = false
+		delete(c.nodes, containerName)
 
-		// t.Logf("✓ Container %s cleaned up", containerName)
+		t.Logf("✓ Container %s cleaned up", containerName)
 	})
 
 	t.Logf("✓ Node %s started successfully", containerName)
@@ -951,27 +951,27 @@ func (c *Cluster) ExecInContainer(containerID string, cmd []string) (string, err
 // Cleanup cleans up cluster resources (but not the network)
 // Following vtcpd-test-suite cleanup patterns - network is persistent
 func (c *Cluster) Cleanup() error {
-	// var errors []string
+	var errors []string
 
-	// // Stop all nodes
-	// for name := range c.nodes {
-	// 	if err := c.StopNode(name); err != nil {
-	// 		errors = append(errors, fmt.Sprintf("failed to stop node %s: %v", name, err))
-	// 	}
-	// }
+	// Stop all nodes
+	for name := range c.nodes {
+		if err := c.StopNode(name); err != nil {
+			errors = append(errors, fmt.Sprintf("failed to stop node %s: %v", name, err))
+		}
+	}
 
 	// NOTE: Do not remove network - following vtcpd-test-suite pattern
 	// Networks are shared between tests and should persist
 	// This prevents conflicts when multiple tests run concurrently
 
 	// Close Docker client
-	// if err := c.dockerClient.Close(); err != nil {
-	// 	errors = append(errors, fmt.Sprintf("failed to close Docker client: %v", err))
-	// }
+	if err := c.dockerClient.Close(); err != nil {
+		errors = append(errors, fmt.Sprintf("failed to close Docker client: %v", err))
+	}
 
-	// if len(errors) > 0 {
-	// 	return fmt.Errorf("cleanup errors: %s", strings.Join(errors, "; "))
-	// }
+	if len(errors) > 0 {
+		return fmt.Errorf("cleanup errors: %s", strings.Join(errors, "; "))
+	}
 
 	return nil
 }
